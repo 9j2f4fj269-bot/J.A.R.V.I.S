@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 from ..registry import Registry
-from . import code, documents, editing, files, git, github, http, js, node_debug, node_diagnostics, node_memory, repo, web, youtube
+from . import code, documents, editing, files, git, github, http, js, node_debug, node_diagnostics, node_memory, python_debug, repo, web, youtube
 
 
 def build_registry(config, memory=None) -> Registry:
@@ -15,6 +15,7 @@ def build_registry(config, memory=None) -> Registry:
     js.register(registry, config)
     node_debug.register(registry, config)
     node_memory.register(registry, config)
+    python_debug.register(registry, config)
     repo.register(registry, config)
     documents.register(registry, config)
     files.register(registry, config)

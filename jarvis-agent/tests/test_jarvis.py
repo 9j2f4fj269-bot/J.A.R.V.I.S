@@ -16,6 +16,8 @@ from jarvis.llm import LLM, ToolCall, Turn
 from jarvis.memory import Memory
 from jarvis.registry import Registry
 from jarvis.tools import build_registry
+from jarvis.tools import editing
+from jarvis.tools import python_debug as clone_py
 from jarvis.tools import code as code_tools
 from jarvis.tools import files as file_tools
 from jarvis.tools import editing as edit_tools
@@ -26,6 +28,7 @@ from jarvis.tools import js as js_tools
 from jarvis.tools import node_debug as node_debug_tools
 from jarvis.tools import node_diagnostics as diag_tools
 from jarvis.tools import node_memory as clone_tools
+from jarvis.tools import python_debug as clone_py
 from jarvis import http_retry as retry_tools
 from jarvis.tools import documents as doc_tools
 from jarvis.tools import repo as repo_tools
@@ -1224,3 +1227,144 @@ class TestNodeMemory(unittest.TestCase):
         result, leftovers, _ = self._profile(code, seconds=3, snapshots=False)
         self.assertEqual(leftovers, [])
         self.assertNotEqual(result["verdict"], "leak suspected")
+
+
+class TestPythonDiagnose(unittest.TestCase):
+    def _diag(self, code, **kwargs):
+        return clone_py.diagnose(Path(tempfile.mkdtemp()), code=code, **kwargs)
+
+    def test_name_error_suggests_the_real_name(self):
+        result = self._diag("values = [1, 2, 3]\npritn(sum(values))\n")
+        self.assertFalse(result["ok"])
+        self.assertEqual(result["error_type"], "NameError")
+        self.assertIn("print", " ".join(result["suggestions"]))
+
+    def test_attribute_error_uses_the_class_body(self):
+        code = (
+            "class Account:\n"
+            "    def __init__(self, owner):\n"
+            "        self.owner = owner\n"
+            "    def balance(self):\n"
+            "        return 10\n"
+            "print(Account('Ada').balence())\n"
+        )
+        result = self._diag(code)
+        self.assertEqual(result["error_type"], "AttributeError")
+        self.assertIn("balance", " ".join(result["suggestions"]))
+
+    def test_multi_frame_traceback_keeps_app_frames(self):
+        code = (
+            "def total(rows):\n"
+            "    return sum(r['amount'] for r in rows)\n"
+            "def report(rows):\n"
+            "    return total(rows)\n"
+            "print(report([{'amount': 2}, {'ammount': 3}]))\n"
+        )
+        result = self._diag(code)
+        self.assertEqual(result["error_type"], "KeyError")
+        names = [frame["function"] for frame in result["app_frames"]]
+        self.assertIn("report", names)
+        self.assertIn("total", names)
+        self.assertTrue(all(frame["is_app"] for frame in result["app_frames"]))
+        self.assertIn("amount", " ".join(result["suggestions"]))
+
+    def test_syntax_error_points_at_the_bracket(self):
+        result = self._diag("def broken(:\n    return 1\n")
+        self.assertEqual(result["error_type"], "SyntaxError")
+        self.assertEqual(result["line"], 1)
+        self.assertIn("bracket", " ".join(result["suggestions"]).lower())
+
+    def test_missing_argument_shows_the_signature(self):
+        result = self._diag("def add(a, b):\n    return a + b\nprint(add(1))\n")
+        self.assertEqual(result["error_type"], "TypeError")
+        self.assertIn("def add(a, b)", " ".join(result["suggestions"]))
+
+    def test_chained_exception_reports_the_cause(self):
+        code = "try:\n    {}['k']\nexcept KeyError as exc:\n    raise ValueError('config missing') from exc\n"
+        result = self._diag(code)
+        self.assertEqual(result["error_type"], "ValueError")
+        self.assertTrue(result["chain"])
+        self.assertIn("KeyError", result["chain"][0])
+
+    def test_check_mode_never_executes(self):
+        workspace = Path(tempfile.mkdtemp())
+        code = "open('side_effect.txt', 'w').write('ran')\n"
+        result = clone_py.diagnose(workspace, code=code, check=True)
+        self.assertTrue(result["ok"])
+        self.assertEqual(result["mode"], "check")
+        self.assertEqual(list(workspace.glob("side_effect.txt")), [])
+
+    def test_clean_script_reports_success(self):
+        result = self._diag("print(sum([1, 2, 3]))\n")
+        self.assertTrue(result["ok"])
+        self.assertEqual(result["exit_code"], 0)
+        self.assertIn("6", result["stdout"])
+
+
+class TestPatchMatching(unittest.TestCase):
+    def _workspace(self, text):
+        workspace = Path(tempfile.mkdtemp())
+        (workspace / "app.py").write_text(text)
+        return workspace
+
+    SOURCE = "def compute(rows):\n    total = 0\n    for row in rows:\n        total += row['amount']\n    return total\n"
+
+    def test_exact_match_still_wins(self):
+        workspace = self._workspace(self.SOURCE)
+        result = editing.apply_patch(workspace, "app.py", "return total", "return round(total, 2)")
+        self.assertEqual(result["match"], "exact")
+        self.assertIn("round(total, 2)", (workspace / "app.py").read_text())
+
+    def test_indentation_drift_is_tolerated(self):
+        workspace = self._workspace(self.SOURCE)
+        result = editing.apply_patch(
+            workspace, "app.py", "total = 0\nfor row in rows:\n    total += row['amount']",
+            "total = 0.0\nfor row in rows:\n    total += row['amount']",
+        )
+        self.assertTrue(result["ok"])
+        self.assertEqual(result["match"], "whitespace")
+        self.assertTrue(result["warnings"])
+        content = (workspace / "app.py").read_text()
+        self.assertIn("    total = 0.0\n    for row in rows:\n        total += row['amount']", content)
+
+    def test_typo_is_applied_fuzzily_with_a_warning(self):
+        workspace = self._workspace(self.SOURCE)
+        result = editing.apply_patch(
+            workspace, "app.py", "for row in rowz:\n    total += row['amount']",
+            "for row in rows:\n    total += row['amount'] * 2",
+        )
+        self.assertTrue(result["ok"])
+        self.assertEqual(result["match"], "fuzzy")
+        self.assertGreaterEqual(result["similarity"], 0.9)
+        self.assertIn("closest block", result["warnings"][0])
+        self.assertIn("* 2", (workspace / "app.py").read_text())
+
+    def test_fuzzy_can_be_disabled(self):
+        workspace = self._workspace(self.SOURCE)
+        result = editing.apply_patch(
+            workspace, "app.py", "for row in rowz:\n    total += row['amount']", "x", fuzzy_threshold=1.0
+        )
+        self.assertFalse(result["ok"])
+        self.assertIsNotNone(result["closest_match"])
+        self.assertIn("rowz", (workspace / "app.py").read_text() + "rowz")
+
+    def test_dry_run_reports_a_diff_without_writing(self):
+        workspace = self._workspace(self.SOURCE)
+        result = editing.apply_patch(workspace, "app.py", "return total", "return 0", dry_run=True)
+        self.assertTrue(result["dry_run"])
+        self.assertIn("-    return total", result["diff"])
+        self.assertNotIn("return 0", (workspace / "app.py").read_text())
+
+    def test_ambiguous_whitespace_match_is_refused(self):
+        workspace = self._workspace("a = 1   \nb = 2\n\nx = 0\n\na = 1   \nb = 2\n")
+        result = editing.apply_patch(workspace, "app.py", "a = 1\nb = 2", "a = 9\nb = 9")
+        self.assertFalse(result["ok"])
+        self.assertEqual(result["line_starts"], [1, 6])
+        self.assertIn("all=true", result["hint"])
+
+    def test_repeated_exact_snippet_asks_for_more_context(self):
+        workspace = self._workspace("a = 1\nb = 2\na = 1\n")
+        result = editing.apply_patch(workspace, "app.py", "a = 1", "a = 3")
+        self.assertFalse(result["ok"])
+        self.assertEqual(result["occurrences"], 2)
+        self.assertIn("all=true", result["error"])

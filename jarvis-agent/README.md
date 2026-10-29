@@ -68,7 +68,7 @@ python -m jarvis --workspace ~/code    # point the sandbox at a real folder
 In chat: `/help`, `/tools`, `/doctor`, `/reset`, `/memory`, `/recall <text>`,
 `/model <name>`, `/quit`.
 
-## Tools (47)
+## Tools (48)
 
 | Area | Tools |
 | --- | --- |
@@ -80,6 +80,7 @@ In chat: `/help`, `/tools`, `/doctor`, `/reset`, `/memory`, `/recall <text>`,
 | Git (local) | `git_clone`, `git_init`, `git_status`, `git_diff`, `git_log`, `git_commit`, `git_push`, `git_pull`, `git_branch`, `git_remotes` |
 | Python | `run_python` |
 | JavaScript | `run_javascript`, `npm_install` |
+| Python diagnosis | `python_diagnose` |
 | JS debugging | `node_check`, `node_diagnose`, `node_profile`, `node_memory` |
 | Verification | `run_tests` (npm/vitest/jest/node --test/pytest/unittest auto-detect) |
 | Code editing | `write_file`, `read_file`, `apply_patch`, `grep_files`, `list_files`, `move_file`, `delete_file` |
@@ -111,6 +112,12 @@ Worth knowing:
   script runs, so growth shows up as a slope in MB/s, and two V8 heap snapshots (baseline plus
   mid-run) are diffed by constructor to name what keeps growing. It tracks off-heap memory too,
   because a Buffer leak looks perfectly flat if you only watch the V8 heap.
+- **`python_diagnose`** parses the traceback instead of echoing it: frames with source context, the
+  exception chain, and a suggestion grounded in the file (the closest real name, the actual signature,
+  the real class body). `check=true` syntax-checks with `ast` and never executes the code.
+- **`apply_patch`** prefers an exact match, then retries ignoring whitespace, then accepts a near match
+  above a similarity threshold and says so. When nothing matches it returns the closest block with line
+  numbers, and `dry_run=true` shows the unified diff before anything is written.
 - **`run_tests`** figures out the runner and returns pass/fail plus output, so the agent
   stops guessing whether code works.
 - **`apply_patch`** edits an exact snippet instead of rewriting a whole file, and
@@ -226,6 +233,7 @@ jarvis/
     node_debug.py        diagnosis harness, syntax check, CPU/heap profiles
     node_diagnostics.py  stack parsing, source context, error explanations
     node_memory.py       leak timeline, heap snapshot diffing
+    python_debug.py      traceback frames, syntax checks, grounded fix hints
     editing.py  apply_patch, grep, move, delete
     http.py     generic API calls
     files.py    workspace-confined file I/O
@@ -238,7 +246,7 @@ return an `ERROR:` string the model can read and recover from.
 ## Tests
 
 ```bash
-python -m unittest discover -s tests -v     # 110 tests, no network, no API key
+python -m unittest discover -s tests -v     # 125 tests, no network, no API key
 ```
 
 Coverage: agent loop and step budget, message persistence, both LLM adapter payload
@@ -272,6 +280,8 @@ internals filtering, and the agent loop's parallel execution plus compaction.
   usually cheaper than many reads.
 - **Digests are capped** at `max_files` (80) and `max_chars` (60k) so a giant repo does not
   flood the context; the rest is listed as omitted.
+- **Fuzzy patches can land in the wrong place**: above the similarity threshold the edit is applied and
+  reported as fuzzy, so check `warnings` in the result rather than assuming an exact match.
 - **Leak verdicts need a window**: a script that finishes in under a second has no timeline, so
   `node_memory` reports "no trend" instead of guessing. Anything long-running is stopped at
   `seconds=` with a final sample.
